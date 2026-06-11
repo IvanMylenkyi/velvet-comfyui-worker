@@ -44,27 +44,34 @@ def wait_for_comfyui(timeout=600):
 
 def get_images_from_history(prompt_id):
     """Получить все изображения из history после завершения генерации."""
-    history = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=10).json()
     images = []
+    try:
+        history = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=10).json()
 
-    if prompt_id not in history:
-        return images
+        if prompt_id not in history:
+            return images
 
-    outputs = history[prompt_id].get("outputs", {})
-    for node_id, output in outputs.items():
-        for img in output.get("images", []):
-            params = urllib.parse.urlencode({
-                "filename": img["filename"],
-                "type": img.get("type", "output"),
-                "subfolder": img.get("subfolder", ""),
-            })
-            img_data = requests.get(
-                f"{COMFY_URL}/view?{params}", timeout=30
-            ).content
-            images.append({
-                "base64": base64.b64encode(img_data).decode("utf-8"),
-                "filename": img["filename"],
-            })
+        outputs = history[prompt_id].get("outputs", {})
+        for node_id, output in outputs.items():
+            if not isinstance(output, dict):
+                continue
+            for img in output.get("images", []):
+                params = urllib.parse.urlencode({
+                    "filename": img["filename"],
+                    "type": img.get("type", "output"),
+                    "subfolder": img.get("subfolder", ""),
+                })
+                img_data = requests.get(
+                    f"{COMFY_URL}/view?{params}", timeout=30
+                ).content
+                images.append({
+                    "base64": base64.b64encode(img_data).decode("utf-8"),
+                    "filename": img["filename"],
+                })
+    except Exception as e:
+        import traceback
+        print(f"[Handler] Error in get_images_from_history: {e}")
+        traceback.print_exc()
 
     return images
 
@@ -230,15 +237,19 @@ def handler(job):
     sock.close()
 
     # 4. Забрать результат — изображения в base64
+    import sys
     images = get_images_from_history(prompt_id)
     print(f"[Handler] Got {len(images)} images for {prompt_id}")
+    sys.stdout.flush()
 
     # Загрузить в S3 напрямую, если есть конфиг
     s3_keys = []
     if s3_config and images:
         print(f"[Handler] Uploading {len(images)} images to S3...")
+        sys.stdout.flush()
         s3_keys = upload_to_s3(images, s3_config)
         print(f"[Handler] Uploaded to S3 keys: {s3_keys}")
+        sys.stdout.flush()
         if s3_keys:
             # Очищаем images только если загрузка успешна, чтобы не превышать лимит Stream payload!
             images = []
