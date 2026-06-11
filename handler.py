@@ -14,7 +14,7 @@ import requests
 import websocket as ws_lib
 
 COMFY_URL = "http://127.0.0.1:8188"
-MAX_WAIT = 600  # максимум 5 минут на генерацию
+MAX_WAIT = 300  # максимум 5 минут на генерацию
 
 
 def wait_for_comfyui(timeout=600):
@@ -153,6 +153,22 @@ def handler(job):
                     # Генерация завершена
                     print(f"[Handler] Generation complete for {prompt_id}")
                     break
+                else:
+                    # Уведомляем о том, какая нода сейчас работает
+                    yield {
+                        "status": "executing",
+                        "node": data.get("node"),
+                        "prompt_id": prompt_id
+                    }
+
+            elif msg_type == "executed":
+                # Перехватываем промежуточные результаты от каждой ноды
+                yield {
+                    "status": "executed",
+                    "node": data.get("node"),
+                    "output": data.get("output"),
+                    "prompt_id": prompt_id
+                }
 
             elif msg_type == "execution_error":
                 sock.close()
