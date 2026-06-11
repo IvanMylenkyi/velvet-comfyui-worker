@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-# Путь к ComfyUI на вашем Network Volume
-COMFYUI_DIR="/workspace/runpod-slim/ComfyUI"
+# В Serverless сетевые диски всегда монтируются в /runpod-volume (а не в /workspace)
+COMFYUI_DIR="/runpod-volume/runpod-slim/ComfyUI"
 VENV_DIR="$COMFYUI_DIR/.venv-cu128"
 
 echo "=== Starting ComfyUI in Background ==="
