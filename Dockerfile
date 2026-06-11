@@ -2,7 +2,7 @@
 FROM runpod/comfyui:latest
 
 # Устанавливаем системно зависимости для serverless handler'а
-RUN pip3 install runpod websocket-client requests
+RUN pip3 install runpod websocket-client requests boto3
 
 # Копируем наши скрипты
 COPY handler.py /handler.py
