@@ -239,8 +239,9 @@ def handler(job):
         print(f"[Handler] Uploading {len(images)} images to S3...")
         s3_keys = upload_to_s3(images, s3_config)
         print(f"[Handler] Uploaded to S3 keys: {s3_keys}")
-        # Очищаем images чтобы не превышать лимит Stream payload!
-        images = []
+        if s3_keys:
+            # Очищаем images только если загрузка успешна, чтобы не превышать лимит Stream payload!
+            images = []
 
     yield {
         "status": "completed",
