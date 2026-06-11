@@ -1,8 +1,13 @@
 #!/bin/bash
 set -e
 
-# В Serverless сетевые диски всегда монтируются в /runpod-volume (а не в /workspace)
-COMFYUI_DIR="/runpod-volume/runpod-slim/ComfyUI"
+# В Serverless сетевые диски всегда монтируются в /runpod-volume.
+# Но так как твой Python venv был создан для /workspace, мы сделаем символическую ссылку, 
+# чтобы не сломать пути (shebangs) внутри venv.
+rm -rf /workspace || true
+ln -s /runpod-volume /workspace
+
+COMFYUI_DIR="/workspace/runpod-slim/ComfyUI"
 VENV_DIR="$COMFYUI_DIR/.venv-cu128"
 
 echo "=== Starting ComfyUI in Background ==="
