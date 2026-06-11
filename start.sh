@@ -21,6 +21,14 @@ else
 fi
 
 cd "$COMFYUI_DIR"
+
+# Фикс: при копировании файлов с Windows папка могла поменять регистр (стать маленькими буквами), 
+# из-за чего Python падает в Linux (где регистр важен). Возвращаем правильное имя:
+if [ -d "custom_nodes/comfyui-saveimagewithmetadata" ]; then
+    echo "Fixing lowercase directory name for ComfyUI-SaveImageWithMetaData..."
+    mv custom_nodes/comfyui-saveimagewithmetadata custom_nodes/ComfyUI-SaveImageWithMetaData || true
+fi
+
 # Запускаем ComfyUI в фоне и пишем логи в файл
 FIXED_ARGS="--listen 0.0.0.0 --port 8188"
 echo "Starting ComfyUI with args: $FIXED_ARGS"
