@@ -29,6 +29,16 @@ def wait_for_comfyui(timeout=120):
         except Exception:
             pass
         time.sleep(1)
+        
+    print("[Handler] Timeout reached. Dumping /comfyui.log to see why it failed:")
+    try:
+        with open("/comfyui.log", "r") as f:
+            print("--- COMFYUI LOG START ---")
+            print(f.read())
+            print("--- COMFYUI LOG END ---")
+    except Exception as e:
+        print(f"Could not read /comfyui.log: {e}")
+        
     raise RuntimeError(f"ComfyUI did not start within {timeout}s")
 
 

@@ -21,10 +21,10 @@ else
 fi
 
 cd "$COMFYUI_DIR"
-# Запускаем ComfyUI в фоне
+# Запускаем ComfyUI в фоне и пишем логи в файл
 FIXED_ARGS="--listen 0.0.0.0 --port 8188"
 echo "Starting ComfyUI with args: $FIXED_ARGS"
-python main.py $FIXED_ARGS &
+python -u main.py $FIXED_ARGS > /comfyui.log 2>&1 &
 
 echo "=== Starting RunPod Serverless Handler ==="
 # Выходим из venv, чтобы запустить хендлер системным питоном (где мы установили runpod sdk)
