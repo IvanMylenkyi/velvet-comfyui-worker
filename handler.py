@@ -1,17 +1,11 @@
-    """
-    RunPod Serverless Handler для ComfyUI.
-    Получает workflow JSON → запускает в ComfyUI → возвращает изображения.
-    Поддерживает streaming прогресса.
-    """
-
-    import runpod
-    import json
-    import uuid
-    import time
-    import base64
-    import urllib.parse
-    import requests
-    import websocket as ws_lib
+import runpod
+import json
+import uuid
+import time
+import base64
+import urllib.parse
+import requests
+import websocket as ws_lib
 
     COMFY_URL = "http://127.0.0.1:8188"
     MAX_WAIT = 300  # максимум 5 минут на генерацию
