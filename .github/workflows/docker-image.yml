@@ -24,4 +24,4 @@ jobs:
       with:
         context: .
         push: true
-        tags: peeenguin/velvet-comfyui-worker:v5
+        tags: peeenguin/velvet-comfyui-worker:v6
