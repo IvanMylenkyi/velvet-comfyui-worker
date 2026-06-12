@@ -42,8 +42,10 @@ def wait_for_comfyui(timeout=1200):
     raise RuntimeError(f"ComfyUI did not start within {timeout}s")
 
 
-def get_images_from_history(prompt_id):
+def get_images_from_history(prompt_id, exclude_filenames=None):
     """Получить все изображения из history после завершения генерации."""
+    if exclude_filenames is None:
+        exclude_filenames = set()
     images = []
     try:
         history = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=10).json()
@@ -56,18 +58,23 @@ def get_images_from_history(prompt_id):
             if not isinstance(output, dict):
                 continue
             for img in output.get("images", []):
+                if img["filename"] in exclude_filenames:
+                    continue
                 params = urllib.parse.urlencode({
                     "filename": img["filename"],
                     "type": img.get("type", "output"),
                     "subfolder": img.get("subfolder", ""),
                 })
-                img_data = requests.get(
+                response = requests.get(
                     f"{COMFY_URL}/view?{params}", timeout=30
-                ).content
-                images.append({
-                    "base64": base64.b64encode(img_data).decode("utf-8"),
-                    "filename": img["filename"],
-                })
+                )
+                if response.status_code == 200:
+                    images.append({
+                        "base64": base64.b64encode(response.content).decode("utf-8"),
+                        "filename": img["filename"],
+                    })
+                else:
+                    print(f"[Handler] Failed to get image {img['filename']}: HTTP {response.status_code}")
     except Exception as e:
         import traceback
         print(f"[Handler] Error in get_images_from_history: {e}")
@@ -161,9 +168,9 @@ def handler(job):
     prompt_id = resp.json().get("prompt_id")
     print(f"[Handler] Workflow submitted, prompt_id={prompt_id}")
 
-    # Добавляем переменные для хранения истории загрузок за сессию
-    session_s3_keys = []
     session_images = []
+    session_s3_keys = []
+    uploaded_filenames = set()
 
     # 3. Слушать прогресс и стримить обновления
     try:
@@ -216,6 +223,7 @@ def handler(job):
                 if isinstance(node_output, dict) and "images" in node_output:
                     node_images = []
                     for img_info in node_output["images"]:
+                        uploaded_filenames.add(img_info["filename"])
                         params = urllib.parse.urlencode({
                             "filename": img_info["filename"],
                             "type": img_info.get("type", "output"),
@@ -223,11 +231,14 @@ def handler(job):
                         })
                         try:
                             # Скачиваем сгенерированную картинку
-                            img_data = requests.get(f"{COMFY_URL}/view?{params}", timeout=30).content
-                            node_images.append({
-                                "base64": base64.b64encode(img_data).decode("utf-8"),
-                                "filename": img_info["filename"]
-                            })
+                            response = requests.get(f"{COMFY_URL}/view?{params}", timeout=30)
+                            if response.status_code == 200:
+                                node_images.append({
+                                    "base64": base64.b64encode(response.content).decode("utf-8"),
+                                    "filename": img_info["filename"]
+                                })
+                            else:
+                                print(f"[Handler] Failed to stream image {img_info['filename']}: HTTP {response.status_code}")
                         except Exception as e:
                             print(f"[Handler] Error downloading image from node {node_id}: {e}")
 
@@ -285,22 +296,17 @@ def handler(job):
         return
 
     sock.close()
-    yield {
-        "status": "completed",
-        "prompt_id": prompt_id,
-        "images": session_images,  # <--- Вот здесь происходит обращение к переменной
-        "s3_keys": session_s3_keys
-    }
-    # 4. Забрать результат — изображения в base64
+
+    # 4. Забрать результат (кэшированные ноды, которые не попали в стриминг)
     import sys
-    images = get_images_from_history(prompt_id)
-    print(f"[Handler] Got {len(images)} images for {prompt_id}")
+    images = get_images_from_history(prompt_id, exclude_filenames=uploaded_filenames)
+    print(f"[Handler] Got {len(images)} cached/unstreamed images for {prompt_id}")
     sys.stdout.flush()
 
     # Загрузить в S3 напрямую, если есть конфиг
     s3_keys = []
     if s3_config and images:
-        print(f"[Handler] Uploading {len(images)} images to S3...")
+        print(f"[Handler] Uploading {len(images)} cached images to S3...")
         sys.stdout.flush()
         s3_keys = upload_to_s3(images, s3_config)
         print(f"[Handler] Uploaded to S3 keys: {s3_keys}")
@@ -309,11 +315,14 @@ def handler(job):
             # Очищаем images только если загрузка успешна, чтобы не превышать лимит Stream payload!
             images = []
 
+    final_images = session_images + images
+    final_s3_keys = session_s3_keys + s3_keys
+
     yield {
         "status": "completed",
         "prompt_id": prompt_id,
-        "images": images,
-        "s3_keys": s3_keys
+        "images": final_images,
+        "s3_keys": final_s3_keys
     }
 
 
