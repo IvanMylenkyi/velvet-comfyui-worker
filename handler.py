@@ -123,11 +123,49 @@ def handler(job):
         return {"object_info": resp.json()}
 
     # --- Генерация ---
+
     workflow = job_input.get("workflow")
     if not workflow:
         return {"error": "No workflow provided"}
 
+    # --- PROCESS BASE64 IMAGES IN WORKFLOW ---
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+            continue
+        
+        # Check all string inputs for data:image/ base64
+        for key, val in node["inputs"].items():
+            if isinstance(val, str) and val.startswith("data:image/"):
+                try:
+                    header, b64_data = val.split(",", 1)
+                    import base64
+                    img_data = base64.b64decode(b64_data)
+                    
+                    # Determine extension from header
+                    ext = "png"
+                    if "jpeg" in header or "jpg" in header:
+                        ext = "jpg"
+                    elif "webp" in header:
+                        ext = "webp"
+                        
+                    filename = f"upload_{uuid.uuid4().hex[:8]}.{ext}"
+                    
+                    # Upload to ComfyUI API using multipart form data
+                    files = {"image": (filename, img_data)}
+                    resp = requests.post(f"{COMFY_URL}/upload/image", files=files, timeout=10)
+                    
+                    if resp.status_code == 200:
+                        upload_res = resp.json()
+                        # ComfyUI returns {"name": "...", "subfolder": "", "type": "input"}
+                        node["inputs"][key] = upload_res.get("name", filename)
+                        print(f"[Handler] Successfully uploaded base64 image as {node['inputs'][key]} for node {node_id}")
+                    else:
+                        print(f"[Handler] Failed to upload base64 image: {resp.text}")
+                except Exception as e:
+                    print(f"[Handler] Error processing base64 image on node {node_id}: {e}")
+
     wait_for_comfyui()
+
 
     client_id = str(uuid.uuid4())
 
