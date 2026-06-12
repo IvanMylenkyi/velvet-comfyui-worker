@@ -14,10 +14,10 @@ import requests
 import websocket as ws_lib
 
 COMFY_URL = "http://127.0.0.1:8188"
-MAX_WAIT = 300  # максимум 5 минут на генерацию
+MAX_WAIT = 900  # максимум 5 минут на генерацию
 
 
-def wait_for_comfyui(timeout=600):
+def wait_for_comfyui(timeout=1200):
     """Ждём пока ComfyUI полностью запустится."""
     start = time.time()
     while time.time() - start < timeout:
