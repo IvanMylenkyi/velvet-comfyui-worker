@@ -14,7 +14,7 @@ import requests
 import websocket as ws_lib
 
 COMFY_URL = "http://127.0.0.1:8188"
-MAX_WAIT = 900  # максимум 5 минут на генерацию
+MAX_WAIT = 1200  # максимум 20 минут на генерацию
 
 
 def wait_for_comfyui(timeout=1200):
@@ -96,11 +96,15 @@ def upload_to_s3(images, s3_config):
         )
 
         uploaded_keys = []
-        for i, img in enumerate(images):
+        for img in images:
             img_data = base64.b64decode(img["base64"])
-            key = f"{path}/{i+1}.png"
+            # Используем имя файла от ComfyUI, чтобы избежать перезаписи
+            filename = img.get("filename", f"{uuid.uuid4().hex}.png")
+            key = f"{path}/{filename}"
+            
             s3.upload_fileobj(io.BytesIO(img_data), bucket, key, ExtraArgs={"ContentType": "image/png", "ACL": "public-read"})
             uploaded_keys.append(key)
+            
         return uploaded_keys
     except Exception as e:
         print(f"[Handler] Failed to upload to S3: {e}")
@@ -123,49 +127,11 @@ def handler(job):
         return {"object_info": resp.json()}
 
     # --- Генерация ---
-
     workflow = job_input.get("workflow")
     if not workflow:
         return {"error": "No workflow provided"}
 
-    # --- PROCESS BASE64 IMAGES IN WORKFLOW ---
-    for node_id, node in workflow.items():
-        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
-            continue
-        
-        # Check all string inputs for data:image/ base64
-        for key, val in node["inputs"].items():
-            if isinstance(val, str) and val.startswith("data:image/"):
-                try:
-                    header, b64_data = val.split(",", 1)
-                    import base64
-                    img_data = base64.b64decode(b64_data)
-                    
-                    # Determine extension from header
-                    ext = "png"
-                    if "jpeg" in header or "jpg" in header:
-                        ext = "jpg"
-                    elif "webp" in header:
-                        ext = "webp"
-                        
-                    filename = f"upload_{uuid.uuid4().hex[:8]}.{ext}"
-                    
-                    # Upload to ComfyUI API using multipart form data
-                    files = {"image": (filename, img_data)}
-                    resp = requests.post(f"{COMFY_URL}/upload/image", files=files, timeout=10)
-                    
-                    if resp.status_code == 200:
-                        upload_res = resp.json()
-                        # ComfyUI returns {"name": "...", "subfolder": "", "type": "input"}
-                        node["inputs"][key] = upload_res.get("name", filename)
-                        print(f"[Handler] Successfully uploaded base64 image as {node['inputs'][key]} for node {node_id}")
-                    else:
-                        print(f"[Handler] Failed to upload base64 image: {resp.text}")
-                except Exception as e:
-                    print(f"[Handler] Error processing base64 image on node {node_id}: {e}")
-
     wait_for_comfyui()
-
 
     client_id = str(uuid.uuid4())
 
@@ -194,6 +160,10 @@ def handler(job):
 
     prompt_id = resp.json().get("prompt_id")
     print(f"[Handler] Workflow submitted, prompt_id={prompt_id}")
+
+    # Добавляем переменные для хранения истории загрузок за сессию
+    session_s3_keys = []
+    session_images = []
 
     # 3. Слушать прогресс и стримить обновления
     try:
@@ -238,34 +208,53 @@ def handler(job):
                     }
 
             elif msg_type == "executed":
-                # Перехватываем промежуточные результаты от каждой ноды
-                output_data = data.get("output", {})
-                
-                if isinstance(output_data, dict) and "images" in output_data:
-                    encoded_images = []
-                    for img in output_data.get("images", []):
+                node_output = data.get("output", {})
+                node_id = data.get("node")
+
+                # --- НОВЫЙ БЛОК: СТРИМИНГ КАРТИНОК ---
+                # Если нода вернула картинки (например, Save Image)
+                if "images" in node_output:
+                    node_images = []
+                    for img_info in node_output["images"]:
+                        params = urllib.parse.urlencode({
+                            "filename": img_info["filename"],
+                            "type": img_info.get("type", "output"),
+                            "subfolder": img_info.get("subfolder", ""),
+                        })
                         try:
-                            params = urllib.parse.urlencode({
-                                "filename": img["filename"],
-                                "type": img.get("type", "output"),
-                                "subfolder": img.get("subfolder", ""),
-                            })
-                            img_data = requests.get(f"{COMFY_URL}/view?{params}", timeout=10).content
-                            b64 = base64.b64encode(img_data).decode("utf-8")
-                            encoded_images.append({
-                                "filename": f"data:image/png;base64,{b64}",
-                                "isS3": True,
-                                "type": "output"
+                            # Скачиваем сгенерированную картинку
+                            img_data = requests.get(f"{COMFY_URL}/view?{params}", timeout=30).content
+                            node_images.append({
+                                "base64": base64.b64encode(img_data).decode("utf-8"),
+                                "filename": img_info["filename"]
                             })
                         except Exception as e:
-                            print(f"[Handler] Error encoding preview image: {e}")
-                    if encoded_images:
-                        output_data["images"] = encoded_images
+                            print(f"[Handler] Error downloading image from node {node_id}: {e}")
 
+                    # Сразу грузим в S3
+                    step_s3_keys = []
+                    if s3_config and node_images:
+                        step_s3_keys = upload_to_s3(node_images, s3_config)
+                        session_s3_keys.extend(step_s3_keys)
+                    elif node_images:
+                        session_images.extend(node_images)
+
+                    # Отправляем клиенту стрим с готовой картинкой!
+                    yield {
+                        "status": "image_ready", # Новый статус для фронтенда
+                        "node": node_id,
+                        "prompt_id": prompt_id,
+                        "s3_keys": step_s3_keys,
+                        # Очищаем base64, если загрузили в S3, чтобы не рвать соединение тяжелым пейлоадом
+                        "images": [] if step_s3_keys else node_images 
+                    }
+                # --- КОНЕЦ НОВОГО БЛОКА ---
+
+                # Отправляем стандартное сообщение о завершении ноды
                 yield {
                     "status": "executed",
-                    "node": data.get("node"),
-                    "output": output_data,
+                    "node": node_id,
+                    "output": node_output,
                     "prompt_id": prompt_id
                 }
 
@@ -296,7 +285,12 @@ def handler(job):
         return
 
     sock.close()
-
+    yield {
+        "status": "completed",
+        "prompt_id": prompt_id,
+        "images": session_images,  # <--- Вот здесь происходит обращение к переменной
+        "s3_keys": session_s3_keys
+    }
     # 4. Забрать результат — изображения в base64
     import sys
     images = get_images_from_history(prompt_id)
