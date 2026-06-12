@@ -174,7 +174,7 @@ def handler(job):
 
             msg = json.loads(raw)
             msg_type = msg.get("type")
-            data = msg.get("data", {})
+            data = msg.get("data") or {}
 
             if msg_type == "progress":
                 # Стримим прогресс клиенту через RunPod streaming API
@@ -208,12 +208,12 @@ def handler(job):
                     }
 
             elif msg_type == "executed":
-                node_output = data.get("output", {})
+                node_output = data.get("output") or {}
                 node_id = data.get("node")
 
                 # --- НОВЫЙ БЛОК: СТРИМИНГ КАРТИНОК ---
                 # Если нода вернула картинки (например, Save Image)
-                if "images" in node_output:
+                if isinstance(node_output, dict) and "images" in node_output:
                     node_images = []
                     for img_info in node_output["images"]:
                         params = urllib.parse.urlencode({
