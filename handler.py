@@ -239,10 +239,33 @@ def handler(job):
 
             elif msg_type == "executed":
                 # Перехватываем промежуточные результаты от каждой ноды
+                output_data = data.get("output", {})
+                
+                if isinstance(output_data, dict) and "images" in output_data:
+                    encoded_images = []
+                    for img in output_data.get("images", []):
+                        try:
+                            params = urllib.parse.urlencode({
+                                "filename": img["filename"],
+                                "type": img.get("type", "output"),
+                                "subfolder": img.get("subfolder", ""),
+                            })
+                            img_data = requests.get(f"{COMFY_URL}/view?{params}", timeout=10).content
+                            b64 = base64.b64encode(img_data).decode("utf-8")
+                            encoded_images.append({
+                                "filename": f"data:image/png;base64,{b64}",
+                                "isS3": True,
+                                "type": "output"
+                            })
+                        except Exception as e:
+                            print(f"[Handler] Error encoding preview image: {e}")
+                    if encoded_images:
+                        output_data["images"] = encoded_images
+
                 yield {
                     "status": "executed",
                     "node": data.get("node"),
-                    "output": data.get("output"),
+                    "output": output_data,
                     "prompt_id": prompt_id
                 }
 
