@@ -9,6 +9,7 @@ import json
 import uuid
 import time
 import base64
+import os
 import urllib.parse
 import requests
 import websocket as ws_lib
@@ -139,6 +140,24 @@ def handler(job):
         return {"error": "No workflow provided"}
 
     wait_for_comfyui()
+
+    # --- Подготовка input_images (если есть) ---
+    input_images = job_input.get("input_images", {})
+    if input_images:
+        input_dir = "/workspace/runpod-slim/ComfyUI/input"
+        os.makedirs(input_dir, exist_ok=True)
+        for filename, b64_str in input_images.items():
+            try:
+                # Отделяем префикс 'data:image/png;base64,' если он есть
+                if "," in b64_str:
+                    b64_str = b64_str.split(",", 1)[1]
+                img_data = base64.b64decode(b64_str)
+                filepath = os.path.join(input_dir, filename)
+                with open(filepath, "wb") as f:
+                    f.write(img_data)
+                print(f"[Handler] Saved input image: {filename}")
+            except Exception as e:
+                print(f"[Handler] Error saving input image {filename}: {e}")
 
     client_id = str(uuid.uuid4())
 
