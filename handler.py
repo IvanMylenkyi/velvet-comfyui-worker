@@ -141,6 +141,33 @@ def handler(job):
 
     wait_for_comfyui()
 
+    # --- Подготовка Custom LoRAs ---
+    custom_loras = job_input.get("custom_loras", [])
+    downloaded_loras = []
+    if custom_loras:
+        loras_dir = "/workspace/runpod-slim/ComfyUI/models/loras"
+        # На некоторых образах путь может быть просто /workspace/ComfyUI
+        if not os.path.exists(loras_dir):
+            loras_dir = "/workspace/ComfyUI/models/loras"
+        os.makedirs(loras_dir, exist_ok=True)
+        
+        for lora in custom_loras:
+            name = lora.get("name")
+            url = lora.get("url")
+            if name and url:
+                filepath = os.path.join(loras_dir, name)
+                try:
+                    if not os.path.exists(filepath):
+                        print(f"[Handler] Downloading Custom LoRA {name} from {url}...")
+                        r = requests.get(url, stream=True, timeout=60)
+                        r.raise_for_status()
+                        with open(filepath, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                    downloaded_loras.append(filepath)
+                except Exception as e:
+                    print(f"[Handler] Failed to download LoRA {name}: {e}")
+
     # --- Подготовка input_images (если есть) ---
     input_images = job_input.get("input_images", {})
     if input_images:
@@ -316,33 +343,43 @@ def handler(job):
 
     sock.close()
 
-    # 4. Забрать результат (кэшированные ноды, которые не попали в стриминг)
-    import sys
-    images = get_images_from_history(prompt_id, exclude_filenames=uploaded_filenames)
-    print(f"[Handler] Got {len(images)} cached/unstreamed images for {prompt_id}")
-    sys.stdout.flush()
-
-    # Загрузить в S3 напрямую, если есть конфиг
-    s3_keys = []
-    if s3_config and images:
-        print(f"[Handler] Uploading {len(images)} cached images to S3...")
+    try:
+        # 4. Забрать результат (кэшированные ноды, которые не попали в стриминг)
+        import sys
+        images = get_images_from_history(prompt_id, exclude_filenames=uploaded_filenames)
+        print(f"[Handler] Got {len(images)} cached/unstreamed images for {prompt_id}")
         sys.stdout.flush()
-        s3_keys = upload_to_s3(images, s3_config)
-        print(f"[Handler] Uploaded to S3 keys: {s3_keys}")
-        sys.stdout.flush()
-        if s3_keys:
-            # Очищаем images только если загрузка успешна, чтобы не превышать лимит Stream payload!
-            images = []
 
-    final_images = session_images + images
-    final_s3_keys = session_s3_keys + s3_keys
+        # Загрузить в S3 напрямую, если есть конфиг
+        s3_keys = []
+        if s3_config and images:
+            print(f"[Handler] Uploading {len(images)} cached images to S3...")
+            sys.stdout.flush()
+            s3_keys = upload_to_s3(images, s3_config)
+            print(f"[Handler] Uploaded to S3 keys: {s3_keys}")
+            sys.stdout.flush()
+            if s3_keys:
+                # Очищаем images только если загрузка успешна, чтобы не превышать лимит Stream payload!
+                images = []
 
-    yield {
-        "status": "completed",
-        "prompt_id": prompt_id,
-        "images": final_images,
-        "s3_keys": final_s3_keys
-    }
+        final_images = session_images + images
+        final_s3_keys = session_s3_keys + s3_keys
+
+        yield {
+            "status": "completed",
+            "prompt_id": prompt_id,
+            "images": final_images,
+            "s3_keys": final_s3_keys
+        }
+    finally:
+        # --- Очистка Custom LoRAs для изоляции и экономии места ---
+        for filepath in downloaded_loras:
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                    print(f"[Handler] Deleted custom LoRA {filepath} for isolation.")
+            except Exception as e:
+                print(f"[Handler] Error deleting LoRA {filepath}: {e}")
 
 
 # Запуск serverless worker с поддержкой streaming
