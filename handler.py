@@ -145,10 +145,17 @@ def handler(job):
     custom_loras = job_input.get("custom_loras", [])
     downloaded_loras = []
     if custom_loras:
-        loras_dir = "/workspace/runpod-slim/ComfyUI/models/loras"
-        # На некоторых образах путь может быть просто /workspace/ComfyUI
-        if not os.path.exists(loras_dir):
-            loras_dir = "/workspace/ComfyUI/models/loras"
+        possible_dirs = [
+            "/runpod-volume/runpod-slim/ComfyUI/models/loras",
+            "/workspace/runpod-slim/ComfyUI/models/loras",
+            "/workspace/ComfyUI/models/loras"
+        ]
+        loras_dir = possible_dirs[0]
+        for d in possible_dirs:
+            if os.path.exists(os.path.dirname(d)):
+                loras_dir = d
+                break
+                
         os.makedirs(loras_dir, exist_ok=True)
         
         for lora in custom_loras:
