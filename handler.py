@@ -118,6 +118,35 @@ def upload_to_s3(images, s3_config):
         print(f"[Handler] Failed to upload to S3: {e}")
         return []
 
+def upload_file_to_s3(filepath, s3_config, content_type="text/plain"):
+    try:
+        if not os.path.exists(filepath):
+            return None
+        import boto3
+        endpoint = s3_config.get("endpoint")
+        bucket = s3_config.get("bucket")
+        access_key = s3_config.get("accessKey")
+        secret_key = s3_config.get("secretKey")
+        path = s3_config.get("path")
+        
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name="fra1"
+        )
+        
+        filename = f"{uuid.uuid4().hex}_worker_log.txt"
+        key = f"{path}/{filename}"
+        
+        with open(filepath, "rb") as f:
+            s3.upload_fileobj(f, bucket, key, ExtraArgs={"ContentType": content_type, "ACL": "public-read"})
+        return key
+    except Exception as e:
+        print(f"[Handler] Failed to upload {filepath} to S3: {e}")
+        return None
+
 def handler(job):
     """
     Основной обработчик. Поддерживает действия:
@@ -299,7 +328,11 @@ def handler(job):
                     step_s3_keys = []
                     if s3_config and node_images:
                         step_s3_keys = upload_to_s3(node_images, s3_config)
-                        session_s3_keys.extend(step_s3_keys)
+                        if step_s3_keys:
+                            session_s3_keys.extend(step_s3_keys)
+                        else:
+                            # S3 fallback: include raw base64 if upload fails
+                            session_images.extend(node_images)
                     elif node_images:
                         session_images.extend(node_images)
 
@@ -324,27 +357,33 @@ def handler(job):
 
             elif msg_type == "execution_error":
                 sock.close()
+                log_key = upload_file_to_s3("/comfyui.log", s3_config) if s3_config else None
                 yield {
                     "status": "error",
                     "error": f"ComfyUI execution error: {json.dumps(data)}",
                     "prompt_id": prompt_id,
+                    "log_s3_key": log_key
                 }
                 return
 
     except ws_lib.WebSocketTimeoutException:
         sock.close()
+        log_key = upload_file_to_s3("/comfyui.log", s3_config) if s3_config else None
         yield {
             "status": "error",
             "error": "Generation timeout — exceeded maximum wait time",
             "prompt_id": prompt_id,
+            "log_s3_key": log_key
         }
         return
     except Exception as e:
         sock.close()
+        log_key = upload_file_to_s3("/comfyui.log", s3_config) if s3_config else None
         yield {
             "status": "error",
             "error": f"WebSocket error: {str(e)}",
             "prompt_id": prompt_id,
+            "log_s3_key": log_key
         }
         return
 
@@ -372,11 +411,25 @@ def handler(job):
         final_images = session_images + images
         final_s3_keys = session_s3_keys + s3_keys
 
+        # --- ЗАЩИТА ОТ ТИХИХ КРАШЕЙ ---
+        # Если генерация "успешно" завершилась, но картинок нет — это тихий краш ноды
+        if not final_images and not final_s3_keys:
+            log_key = upload_file_to_s3("/comfyui.log", s3_config) if s3_config else None
+            yield {
+                "status": "error",
+                "error": "Workflow finished, but no images were generated! Silent node crash detected.",
+                "prompt_id": prompt_id,
+                "log_s3_key": log_key
+            }
+            return
+
+        log_key = upload_file_to_s3("/comfyui.log", s3_config) if s3_config else None
         yield {
             "status": "completed",
             "prompt_id": prompt_id,
             "images": final_images,
-            "s3_keys": final_s3_keys
+            "s3_keys": final_s3_keys,
+            "log_s3_key": log_key
         }
     finally:
         # --- Очистка Custom LoRAs для изоляции и экономии места ---
