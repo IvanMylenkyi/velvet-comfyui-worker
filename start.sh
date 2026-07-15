@@ -72,6 +72,22 @@ rm -rf "custom_nodes/comfyui-saveimagewithmetadata" || true
 rm -rf "custom_nodes/ComfyUI-SaveImageWithMetaData" || true
 rm -rf "custom_nodes/Comfyui-SaveImageWithMetaData" || true
 
+# ==============================================================================
+# Принудительное скачивание LoRA перед запуском
+# ==============================================================================
+LORA_DIR="$COMFYUI_DIR/models/loras"
+LORA_NAME="pilemating_v1.safetensors"
+LORA_URL="https://civitai.red/api/download/models/1881743?fileId=1781560&token=6e6ecd3f0a435ff0e8146438871b33c3"
+
+mkdir -p "$LORA_DIR"
+if [ ! -f "$LORA_DIR/$LORA_NAME" ]; then
+    echo "Downloading LoRA: $LORA_NAME..."
+    curl -L -k "$LORA_URL" -o "$LORA_DIR/$LORA_NAME"
+    echo "LoRA downloaded successfully."
+else
+    echo "LoRA $LORA_NAME already exists, skipping download."
+fi
+
 # Запускаем ComfyUI в фоне и пишем логи в файл (в локальный /comfyui.log - это отлично!)
 FIXED_ARGS="--listen 0.0.0.0 --port 8188"
 echo "Starting ComfyUI with args: $FIXED_ARGS"
