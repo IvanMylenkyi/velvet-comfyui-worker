@@ -73,104 +73,44 @@ jobs:
       - name: Verify remote image contract without pulling the image
         env:
           PUBLISHED_DIGEST: ${{ steps.build.outputs.digest }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         shell: bash
         run: |
-          python3 - <<'PY'
-          import base64
+          image="${IMAGE_NAME}:${IMAGE_TAG}"
+          docker buildx imagetools inspect "$image" --format '{{json .}}' > /tmp/worker-image-inspect.json
+          PUBLISHED_DIGEST="$PUBLISHED_DIGEST" IMAGE="$image" EXPECTED_SHA="$GITHUB_SHA" \
+            python3 - <<'PY'
           import json
           import os
-          import urllib.request
 
-          image = os.environ["IMAGE_NAME"]
-          tag = os.environ["IMAGE_TAG"]
-          expected_sha = os.environ["GITHUB_SHA"]
-          expected_digest = os.environ.get("PUBLISHED_DIGEST", "")
-          repository = image.split("/", 1)[1]
+          with open('/tmp/worker-image-inspect.json', encoding='utf-8') as stream:
+              inspected = json.load(stream)
 
-          token_url = (
-              "https://auth.docker.io/token?service=registry.docker.io&scope="
-              f"repository:{repository}:pull"
-          )
-          credentials = base64.b64encode(
-              f"{os.environ['DOCKERHUB_USERNAME']}:{os.environ['DOCKERHUB_TOKEN']}".encode()
-          ).decode()
-          token_request = urllib.request.Request(
-              token_url,
-              headers={"Authorization": f"Basic {credentials}"},
-          )
-          with urllib.request.urlopen(token_request) as response:
-              token = json.load(response)["token"]
+          image = inspected.get('Image')
+          if isinstance(image, dict) and 'config' not in image:
+              image = image.get('linux/amd64')
+          if not isinstance(image, dict) or not isinstance(image.get('config'), dict):
+              raise SystemExit('remote inspection did not return linux/amd64 image config')
 
-          manifest_url = f"https://registry-1.docker.io/v2/{repository}/manifests/{tag}"
-          headers = {
-              "Authorization": f"Bearer {token}",
-              "Accept": ", ".join([
-                  "application/vnd.oci.image.index.v1+json",
-                  "application/vnd.docker.distribution.manifest.list.v2+json",
-                  "application/vnd.oci.image.manifest.v1+json",
-                  "application/vnd.docker.distribution.manifest.v2+json",
-              ]),
-          }
-          request = urllib.request.Request(manifest_url, headers=headers)
-          with urllib.request.urlopen(request) as response:
-              manifest = json.load(response)
-              remote_digest = response.headers.get("Docker-Content-Digest", "")
-
-          if expected_digest and remote_digest != expected_digest:
-              raise SystemExit(
-                  f"published digest mismatch: action={expected_digest} registry={remote_digest}"
-              )
-
-          manifest_digest = remote_digest
-          if "manifests" in manifest:
-              candidates = [
-                  item for item in manifest["manifests"]
-                  if item.get("platform", {}).get("os") == "linux"
-                  and item.get("platform", {}).get("architecture") == "amd64"
-              ]
-              if len(candidates) != 1:
-                  raise SystemExit("remote manifest does not contain one linux/amd64 image")
-              manifest_digest = candidates[0]["digest"]
-              request = urllib.request.Request(
-                  f"https://registry-1.docker.io/v2/{repository}/manifests/{manifest_digest}",
-                  headers=headers,
-              )
-              with urllib.request.urlopen(request) as response:
-                  image_manifest = json.load(response)
-          else:
-              image_manifest = manifest
-
-          config_digest = image_manifest["config"]["digest"]
-          request = urllib.request.Request(
-              f"https://registry-1.docker.io/v2/{repository}/blobs/{config_digest}",
-              headers={"Authorization": f"Bearer {token}"},
-          )
-          with urllib.request.urlopen(request) as response:
-              config = json.load(response)
-
-          image_config = config["config"]
-          if image_config.get("Entrypoint") != ["/bin/bash", "/start.sh"]:
-              raise SystemExit(f"unexpected entrypoint: {image_config.get('Entrypoint')!r}")
-          if image_config.get("Cmd") not in (None, []):
-              raise SystemExit(f"unexpected cmd: {image_config.get('Cmd')!r}")
-          if config.get("architecture") != "amd64" or config.get("os") != "linux":
-              raise SystemExit("remote config is not linux/amd64")
-          revision = image_config.get("Labels", {}).get("org.opencontainers.image.revision")
-          if revision != expected_sha:
+          config = image['config']
+          if config.get('Entrypoint') != ['/bin/bash', '/start.sh']:
+              raise SystemExit(f"unexpected entrypoint: {config.get('Entrypoint')!r}")
+          if config.get('Cmd') not in (None, []):
+              raise SystemExit(f"unexpected cmd: {config.get('Cmd')!r}")
+          if image.get('architecture') != 'amd64' or image.get('os') != 'linux':
+              raise SystemExit('remote config is not linux/amd64')
+          revision = (config.get('Labels') or {}).get('org.opencontainers.image.revision')
+          if revision != os.environ['EXPECTED_SHA']:
               raise SystemExit(f"revision label mismatch: {revision!r}")
 
-          summary_digest = expected_digest or remote_digest or manifest_digest
-          print(f"verified_image={image}:{tag}")
-          print(f"verified_digest={summary_digest}")
+          print(f"verified_image={os.environ['IMAGE']}")
+          print(f"verified_digest={os.environ.get('PUBLISHED_DIGEST', '')}")
           print(f"verified_revision={revision}")
-          print("verified_entrypoint=/bin/bash /start.sh")
-          print("verified_cmd=[]")
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              summary.write("## Worker image acceptance\n")
-              summary.write(f"- image={image}:{tag}\n")
-              summary.write(f"- digest={summary_digest}\n")
+          print('verified_entrypoint=/bin/bash /start.sh')
+          print('verified_cmd=[]')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('## Worker image acceptance\n')
+              summary.write(f"- image={os.environ['IMAGE']}\n")
+              summary.write(f"- digest={os.environ.get('PUBLISHED_DIGEST', '')}\n")
               summary.write(f"- worker_build={revision}\n")
-              summary.write("- remote_contract=passed\n")
+              summary.write('- remote_contract=passed\n')
           PY
