@@ -76,7 +76,10 @@ jobs:
         shell: bash
         run: |
           docker run --rm --entrypoint /bin/bash "${IMAGE_NAME}:${IMAGE_TAG}" -n /start.sh
-          docker run --rm --entrypoint python3 "${IMAGE_NAME}:${IMAGE_TAG}" -c \
+          docker run --rm \
+            -e COMFYUI_DIR=/workspace/runpod-slim/ComfyUI \
+            -e LORA_DIR=/workspace/runpod-slim/ComfyUI/models/loras \
+            --entrypoint python3 "${IMAGE_NAME}:${IMAGE_TAG}" -c \
             "import sys; sys.path.insert(0, '/'); import boto3, handler, model_artifacts, requests, runpod, websocket"
 
       - name: Publish immutable worker image
