@@ -80,6 +80,28 @@ class ModelArtifactWorkerEnvelopeTests(unittest.TestCase):
             cleanup_model_artifacts(paths, target)
             self.assertFalse(os.path.exists(paths[0]))
 
+    def test_job_private_runtime_filename_survives_visibility_preflight(self):
+        data = b"verified-model-bytes"
+        artifact = self.envelope(data)
+        runtime_filename = "vv_artifact_job123_0.safetensors"
+        with tempfile.TemporaryDirectory() as target:
+            paths = prepare_model_artifacts(
+                [artifact],
+                target,
+                http_get=FakeGet(FakeResponse(data)),
+                output_filenames={artifact["filename"]: runtime_filename},
+            )
+            self.assertEqual(os.path.basename(paths[0]), runtime_filename)
+            response = ObjectInfoResponse({"CR LoRA Stack": {"input": {
+                "required": {"lora_name_1": [runtime_filename]}
+            }}})
+            verify_model_artifacts_visible(
+                [artifact], paths, FakeGet(response), "http://comfy/object_info",
+                [runtime_filename],
+            )
+            cleanup_model_artifacts(paths, target)
+            self.assertFalse(os.path.exists(paths[0]))
+
     def test_rejects_digest_mismatch_and_removes_partial_file(self):
         with tempfile.TemporaryDirectory() as target:
             with self.assertRaisesRegex(ValueError, "digest"):

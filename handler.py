@@ -41,6 +41,19 @@ def _safe_error_text(error):
     return text
 
 
+def _rewrite_exact_strings(value, replacements):
+    """Bind verified job-private LoRA names into a workflow copy."""
+    if isinstance(value, dict):
+        return {key: _rewrite_exact_strings(item, replacements) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_rewrite_exact_strings(item, replacements) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_rewrite_exact_strings(item, replacements) for item in value)
+    if isinstance(value, str):
+        return replacements.get(value, value)
+    return value
+
+
 def wait_for_comfyui(timeout=1200):
     """Ждём пока ComfyUI полностью запустится."""
     start = time.time()
@@ -199,7 +212,12 @@ def upload_file_to_s3(filepath, s3_config, content_type="text/plain"):
         print(f"[Handler] Failed to upload {filepath} to S3: {_safe_error_text(e)}")
         return None
 
-def _run_job(job, prepared_artifact_paths=None):
+def _run_job(
+    job,
+    prepared_artifact_paths=None,
+    visible_artifact_filenames=None,
+    workflow_override=None,
+):
     """
     Основной обработчик. Поддерживает действия:
     - generate: генерация изображений по workflow (default)
@@ -233,7 +251,7 @@ def _run_job(job, prepared_artifact_paths=None):
             return
 
     # --- Генерация ---
-    workflow = job_input.get("workflow")
+    workflow = workflow_override if workflow_override is not None else job_input.get("workflow")
     if not workflow:
         yield yield_error("No workflow provided")
         return
@@ -250,6 +268,7 @@ def _run_job(job, prepared_artifact_paths=None):
             prepared_artifact_paths or [],
             requests.get,
             f"{COMFY_URL}/object_info",
+            visible_artifact_filenames,
         )
     except Exception as e:
         yield yield_error(f"ComfyUI model-artifact preflight failed: {_safe_error_text(e)}")
@@ -480,14 +499,34 @@ def handler(job):
         return
     loras_dir = LORA_DIR
     prepared = []
+    runtime_filenames = {}
     try:
+        for index, envelope in enumerate(model_artifacts):
+            if isinstance(envelope, dict) and isinstance(envelope.get("filename"), str):
+                # The RunPod network volume is shared by workers. A stable
+                # filename plus unconditional post-job cleanup lets one
+                # worker remove another worker's LoRA while Comfy is loading
+                # it. Use a job-private runtime name so cleanup cannot race.
+                runtime_filenames[envelope["filename"]] = (
+                    f"vv_artifact_{uuid.uuid4().hex}_{index}.safetensors"
+                )
         prepared = prepare_model_artifacts(
             model_artifacts,
             loras_dir,
+            output_filenames=runtime_filenames,
         )
         for path in prepared:
             print(f"prepared_artifact={os.path.basename(path)}")
-        yield from _run_job(job, prepared)
+        bound_workflow = _rewrite_exact_strings(
+            job_input.get("workflow"),
+            runtime_filenames,
+        )
+        visible_names = [
+            runtime_filenames.get(envelope.get("filename"), envelope.get("filename"))
+            for envelope in model_artifacts
+            if isinstance(envelope, dict)
+        ]
+        yield from _run_job(job, prepared, visible_names, bound_workflow)
     except Exception as error:
         yield {
             "status": "error",

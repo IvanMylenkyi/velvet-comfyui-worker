@@ -15,18 +15,27 @@ CHUNK_BYTES = 4 * 1024 * 1024
 ID = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 FILENAME = re.compile(r"^[A-Za-z0-9_-]{8,128}-[0-9a-f]{16}\.safetensors$")
+RUNTIME_FILENAME = re.compile(r"^[A-Za-z0-9_-]{8,160}\.safetensors$")
 
 
-def prepare_model_artifacts(envelopes, target_dir, http_get=None):
+def prepare_model_artifacts(envelopes, target_dir, http_get=None, output_filenames=None):
     if not isinstance(envelopes, list) or len(envelopes) > MAX_ARTIFACTS:
         raise ValueError("model artifact envelope count is invalid")
     if not envelopes:
         return []
+    if output_filenames is not None and not isinstance(output_filenames, dict):
+        raise ValueError("model artifact runtime filename map is invalid")
     validated = [_validate_envelope(item) for item in envelopes]
     identities = [item["artifactId"] for item in validated]
     filenames = [item["filename"] for item in validated]
     if len(set(identities)) != len(identities) or len(set(filenames)) != len(filenames):
         raise ValueError("duplicate model artifact envelope")
+    runtime_filenames = [
+        (output_filenames or {}).get(filename, filename)
+        for filename in filenames
+    ]
+    if len(set(runtime_filenames)) != len(runtime_filenames):
+        raise ValueError("duplicate model artifact runtime filename")
     fetch = http_get or requests.get
 
     os.makedirs(target_dir, exist_ok=True)
@@ -34,7 +43,10 @@ def prepare_model_artifacts(envelopes, target_dir, http_get=None):
     prepared = []
     try:
         for envelope in validated:
-            final_path = os.path.realpath(os.path.join(target_root, envelope["filename"]))
+            filename = (output_filenames or {}).get(envelope["filename"], envelope["filename"])
+            if not isinstance(filename, str) or not RUNTIME_FILENAME.fullmatch(filename):
+                raise ValueError("model artifact runtime filename is invalid")
+            final_path = os.path.realpath(os.path.join(target_root, filename))
             if os.path.dirname(final_path) != target_root:
                 raise ValueError("model artifact filename escapes managed directory")
             partial_path = final_path + ".part"
@@ -98,16 +110,33 @@ def cleanup_model_artifacts(paths, target_dir):
             pass
 
 
-def verify_model_artifacts_visible(envelopes, prepared_paths, object_info_get, object_info_url):
+def verify_model_artifacts_visible(
+    envelopes,
+    prepared_paths,
+    object_info_get,
+    object_info_url,
+    visible_filenames=None,
+):
     """Fail closed unless files exist and ComfyUI exposes their exact names."""
     if not isinstance(envelopes, list):
         raise ValueError("model artifact envelope list is invalid")
     if len(envelopes) != len(prepared_paths):
         raise ValueError("prepared model artifact count is invalid")
+    if visible_filenames is not None and (
+        not isinstance(visible_filenames, list)
+        or len(visible_filenames) != len(envelopes)
+    ):
+        raise ValueError("model artifact visible filename count is invalid")
 
     filenames = []
-    for envelope, path in zip(envelopes, prepared_paths):
-        filename = envelope.get("filename") if isinstance(envelope, dict) else None
+    for index, (envelope, path) in enumerate(zip(envelopes, prepared_paths)):
+        filename = (
+            visible_filenames[index]
+            if visible_filenames is not None
+            else envelope.get("filename") if isinstance(envelope, dict) else None
+        )
+        if not isinstance(filename, str) or not RUNTIME_FILENAME.fullmatch(filename):
+            raise ValueError("prepared model artifact visible filename is invalid")
         if not isinstance(filename, str) or os.path.basename(path) != filename:
             raise ValueError("prepared model artifact filename is invalid")
         if not os.path.isfile(path):
