@@ -11,11 +11,34 @@ import time
 import base64
 import os
 import urllib.parse
+import re
 import requests
 import websocket as ws_lib
+from model_artifacts import (
+    cleanup_model_artifacts,
+    prepare_model_artifacts,
+    verify_model_artifacts_visible,
+)
 
 COMFY_URL = "http://127.0.0.1:8188"
 MAX_WAIT = 1200  # максимум 20 минут на генерацию
+WORKER_BUILD_SHA = os.environ.get("WORKER_BUILD_SHA", "local")
+COMFYUI_DIR = os.environ.get("COMFYUI_DIR")
+LORA_DIR = os.environ.get("LORA_DIR")
+if not COMFYUI_DIR or not LORA_DIR:
+    raise RuntimeError("COMFYUI_DIR and LORA_DIR must be provided by start.sh")
+
+
+def _safe_error_text(error):
+    """Keep query-string capabilities and credentials out of worker logs."""
+    text = str(error)
+    text = re.sub(r"(?i)(https?://[^\s?]+)\?[^\s]+", r"\1?<redacted>", text)
+    text = re.sub(
+        r"(?i)([?&](?:token|sig|signature|key|secret|access_token)=[^&\s]+)",
+        "?<redacted>",
+        text,
+    )
+    return text
 
 
 def wait_for_comfyui(timeout=1200):
@@ -38,13 +61,29 @@ def wait_for_comfyui(timeout=1200):
             print(f.read())
             print("--- COMFYUI LOG END ---")
     except Exception as e:
-        print(f"Could not read /comfyui.log: {e}")
+        print(f"Could not read /comfyui.log: {_safe_error_text(e)}")
 
     raise RuntimeError(f"ComfyUI did not start within {timeout}s")
 
 
-def get_images_from_history(prompt_id, exclude_filenames=None):
-    """Получить все изображения из history после завершения генерации."""
+def _image_descriptor_key(image):
+    """Stable identity for one Comfy output image within a prompt."""
+    node_id = image.get("nodeId") or image.get("node_id") or ""
+    object_index = image.get("objectIndex")
+    if not isinstance(object_index, int):
+        object_index = -1
+    return str(node_id), object_index, str(image.get("filename") or "")
+
+
+def get_images_from_history(prompt_id, exclude_descriptors=None, exclude_filenames=None):
+    """Получить все изображения из history после завершения генерации.
+
+    ``exclude_filenames`` is retained for old callers, while new callers use
+    the full output descriptor so equal filenames from different nodes do not
+    accidentally deduplicate one another.
+    """
+    if exclude_descriptors is None:
+        exclude_descriptors = set()
     if exclude_filenames is None:
         exclude_filenames = set()
     images = []
@@ -58,7 +97,16 @@ def get_images_from_history(prompt_id, exclude_filenames=None):
         for node_id, output in outputs.items():
             if not isinstance(output, dict):
                 continue
-            for img in output.get("images", []):
+            for object_index, img in enumerate(output.get("images", [])):
+                if not isinstance(img, dict) or not img.get("filename"):
+                    continue
+                descriptor = {
+                    "nodeId": str(node_id) if node_id is not None else None,
+                    "objectIndex": object_index,
+                    "filename": img["filename"],
+                }
+                if _image_descriptor_key(descriptor) in exclude_descriptors:
+                    continue
                 if img["filename"] in exclude_filenames:
                     continue
                 params = urllib.parse.urlencode({
@@ -73,13 +121,13 @@ def get_images_from_history(prompt_id, exclude_filenames=None):
                     images.append({
                         "base64": base64.b64encode(response.content).decode("utf-8"),
                         "filename": img["filename"],
+                        "nodeId": str(node_id) if node_id is not None else None,
+                        "objectIndex": object_index,
                     })
                 else:
                     print(f"[Handler] Failed to get image {img['filename']}: HTTP {response.status_code}")
     except Exception as e:
-        import traceback
-        print(f"[Handler] Error in get_images_from_history: {e}")
-        traceback.print_exc()
+        print(f"[Handler] Error in get_images_from_history: {_safe_error_text(e)}")
 
     return images
 
@@ -110,11 +158,16 @@ def upload_to_s3(images, s3_config):
             key = f"{path}/{filename}" if path else filename
             
             s3.upload_fileobj(io.BytesIO(img_data), bucket, key, ExtraArgs={"ContentType": "image/png", "ACL": "public-read"})
-            uploaded_keys.append(key)
+            uploaded_keys.append({
+                "storageKey": key,
+                "filename": filename,
+                "nodeId": img.get("nodeId") or img.get("node_id"),
+                "objectIndex": img.get("objectIndex") if isinstance(img.get("objectIndex"), int) else None,
+            })
             
         return uploaded_keys
     except Exception as e:
-        print(f"[Handler] Failed to upload to S3: {e}")
+        print(f"[Handler] Failed to upload to S3: {_safe_error_text(e)}")
         return []
 
 def upload_file_to_s3(filepath, s3_config, content_type="text/plain"):
@@ -143,10 +196,10 @@ def upload_file_to_s3(filepath, s3_config, content_type="text/plain"):
             s3.upload_fileobj(f, bucket, key, ExtraArgs={"ContentType": content_type, "ACL": "public-read"})
         return key
     except Exception as e:
-        print(f"[Handler] Failed to upload {filepath} to S3: {e}")
+        print(f"[Handler] Failed to upload {filepath} to S3: {_safe_error_text(e)}")
         return None
 
-def handler(job):
+def _run_job(job, prepared_artifact_paths=None):
     """
     Основной обработчик. Поддерживает действия:
     - generate: генерация изображений по workflow (default)
@@ -176,7 +229,7 @@ def handler(job):
             yield {"object_info": resp.json()}
             return
         except Exception as e:
-            yield yield_error(f"Failed to get object_info: {str(e)}")
+            yield yield_error(f"Failed to get object_info: {_safe_error_text(e)}")
             return
 
     # --- Генерация ---
@@ -188,49 +241,26 @@ def handler(job):
     try:
         wait_for_comfyui()
     except Exception as e:
-        yield yield_error(f"ComfyUI failed to start: {str(e)}")
+        yield yield_error(f"ComfyUI failed to start: {_safe_error_text(e)}")
         return
 
-    # --- Подготовка Custom LoRAs ---
-    custom_loras = job_input.get("custom_loras", [])
-    downloaded_loras = []
-    if custom_loras:
-        try:
-            possible_dirs = [
-                "/runpod-volume/runpod-slim/ComfyUI/models/loras",
-                "/workspace/runpod-slim/ComfyUI/models/loras",
-                "/workspace/ComfyUI/models/loras"
-            ]
-            loras_dir = possible_dirs[0]
-            for d in possible_dirs:
-                if os.path.exists(os.path.dirname(d)):
-                    loras_dir = d
-                    break
-                    
-            os.makedirs(loras_dir, exist_ok=True)
-            
-            for lora in custom_loras:
-                name = lora.get("name")
-                url = lora.get("url")
-                if name and url:
-                    filepath = os.path.join(loras_dir, name)
-                    if not os.path.exists(filepath):
-                        print(f"[Handler] Downloading Custom LoRA {name} from {url}...")
-                        r = requests.get(url, stream=True, timeout=60)
-                        r.raise_for_status()
-                        with open(filepath, "wb") as f:
-                            for chunk in r.iter_content(chunk_size=8192):
-                                f.write(chunk)
-                    downloaded_loras.append(filepath)
-        except Exception as e:
-            yield yield_error(f"Failed to process custom LoRAs: {str(e)}")
-            return
+    try:
+        verify_model_artifacts_visible(
+            job_input.get("model_artifacts", []),
+            prepared_artifact_paths or [],
+            requests.get,
+            f"{COMFY_URL}/object_info",
+        )
+    except Exception as e:
+        yield yield_error(f"ComfyUI model-artifact preflight failed: {_safe_error_text(e)}")
+        return
+
 
     # --- Подготовка input_images (если есть) ---
     input_images = job_input.get("input_images", {})
     if input_images:
         try:
-            input_dir = "/workspace/runpod-slim/ComfyUI/input"
+            input_dir = os.path.join(COMFYUI_DIR, "input")
             os.makedirs(input_dir, exist_ok=True)
             for filename, b64_str in input_images.items():
                 if "," in b64_str:
@@ -241,7 +271,7 @@ def handler(job):
                     f.write(img_data)
                 print(f"[Handler] Saved input image: {filename}")
         except Exception as e:
-            yield yield_error(f"Error saving input images: {str(e)}")
+            yield yield_error(f"Error saving input images: {_safe_error_text(e)}")
             return
 
     client_id = str(uuid.uuid4())
@@ -252,7 +282,7 @@ def handler(job):
     try:
         sock.connect(f"ws://127.0.0.1:8188/ws?clientId={client_id}")
     except Exception as e:
-        yield yield_error(f"Failed to connect to ComfyUI WebSocket: {str(e)}")
+        yield yield_error(f"Failed to connect to ComfyUI WebSocket: {_safe_error_text(e)}")
         return
 
     # 2. Отправить workflow
@@ -264,7 +294,7 @@ def handler(job):
         )
     except Exception as e:
         sock.close()
-        yield yield_error(f"Failed to submit workflow: {str(e)}")
+        yield yield_error(f"Failed to submit workflow: {_safe_error_text(e)}")
         return
 
     if resp.status_code != 200:
@@ -277,7 +307,7 @@ def handler(job):
 
     session_images = []
     session_s3_keys = []
-    uploaded_filenames = set()
+    session_descriptor_keys = set()
 
     # 3. Слушать прогресс и стримить обновления
     try:
@@ -323,8 +353,14 @@ def handler(job):
 
                 if isinstance(node_output, dict) and "images" in node_output:
                     node_images = []
-                    for img_info in node_output["images"]:
-                        uploaded_filenames.add(img_info["filename"])
+                    for object_index, img_info in enumerate(node_output["images"]):
+                        if not isinstance(img_info, dict) or not img_info.get("filename"):
+                            continue
+                        descriptor = {
+                            "nodeId": str(node_id) if node_id is not None else None,
+                            "objectIndex": object_index,
+                            "filename": img_info["filename"],
+                        }
                         params = urllib.parse.urlencode({
                             "filename": img_info["filename"],
                             "type": img_info.get("type", "output"),
@@ -335,12 +371,25 @@ def handler(job):
                             if response.status_code == 200:
                                 node_images.append({
                                     "base64": base64.b64encode(response.content).decode("utf-8"),
-                                    "filename": img_info["filename"]
+                                    "filename": img_info["filename"],
+                                    "nodeId": str(node_id) if node_id is not None else None,
+                                    "objectIndex": object_index,
                                 })
                             else:
                                 print(f"[Handler] Failed to stream image {img_info['filename']}: HTTP {response.status_code}")
                         except Exception as e:
-                            print(f"[Handler] Error downloading image from node {node_id}: {e}")
+                            print(f"[Handler] Error downloading image from node {node_id}: {_safe_error_text(e)}")
+
+                    # A worker can observe the same executed event more than
+                    # once during reconnect/replay. Keep one descriptor per
+                    # node/object in the aggregate result.
+                    fresh_node_images = []
+                    for image in node_images:
+                        descriptor_key = _image_descriptor_key(image)
+                        if descriptor_key not in session_descriptor_keys:
+                            session_descriptor_keys.add(descriptor_key)
+                            fresh_node_images.append(image)
+                    node_images = fresh_node_images
 
                     step_s3_keys = []
                     if s3_config and node_images:
@@ -378,14 +427,14 @@ def handler(job):
         return
     except Exception as e:
         sock.close()
-        yield yield_error(f"WebSocket error: {str(e)}", prompt_id)
+        yield yield_error(f"WebSocket error: {_safe_error_text(e)}", prompt_id)
         return
 
     sock.close()
 
     try:
         import sys
-        images = get_images_from_history(prompt_id, exclude_filenames=uploaded_filenames)
+        images = get_images_from_history(prompt_id, exclude_descriptors=session_descriptor_keys)
         print(f"[Handler] Got {len(images)} cached/unstreamed images for {prompt_id}")
         sys.stdout.flush()
 
@@ -416,15 +465,40 @@ def handler(job):
             "log_s3_key": log_key
         }
     finally:
-        for filepath in downloaded_loras:
-            try:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-                    print(f"[Handler] Deleted custom LoRA {filepath} for isolation.")
-            except Exception as e:
-                print(f"[Handler] Error deleting LoRA {filepath}: {e}")
+        pass
 
-runpod.serverless.start({
-    "handler": handler,
-    "return_aggregate_stream": True,
-})
+
+def handler(job):
+    job_input = job.get("input", {}) if isinstance(job, dict) else {}
+    model_artifacts = job_input.get("model_artifacts", [])
+    model_artifacts_count = len(model_artifacts) if isinstance(model_artifacts, list) else 0
+    print(f"worker_build={WORKER_BUILD_SHA}")
+    print(f"model_artifacts_count={model_artifacts_count}")
+    print(f"lora_directory={LORA_DIR}")
+    if job_input.get("action", "generate") != "generate":
+        yield from _run_job(job)
+        return
+    loras_dir = LORA_DIR
+    prepared = []
+    try:
+        prepared = prepare_model_artifacts(
+            model_artifacts,
+            loras_dir,
+        )
+        for path in prepared:
+            print(f"prepared_artifact={os.path.basename(path)}")
+        yield from _run_job(job, prepared)
+    except Exception as error:
+        yield {
+            "status": "error",
+            "comfy_error": f"Failed to prepare verified model artifacts: {_safe_error_text(error)}",
+            "log_s3_key": None,
+        }
+    finally:
+        cleanup_model_artifacts(prepared, loras_dir)
+
+if __name__ == "__main__":
+    runpod.serverless.start({
+        "handler": handler,
+        "return_aggregate_stream": True,
+    })

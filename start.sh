@@ -1,21 +1,65 @@
 #!/bin/bash
-set -e
+set -Eeuo pipefail
 
-# В Serverless сетевые диски всегда монтируются в /runpod-volume.
-# Но так как твой Python venv был создан для /workspace, мы сделаем символическую ссылку, 
-# чтобы не сломать пути (shebangs) внутри venv.
-rm -rf /workspace || true
+STARTUP_PHASE="bootstrap"
+
+startup_error() {
+    local status=$?
+    local command_name="${BASH_COMMAND%% *}"
+    printf 'worker_startup_failed startup_phase=%s exit_code=%s line=%s command=%s\n' \
+        "$STARTUP_PHASE" "$status" "${BASH_LINENO[0]:-unknown}" "$command_name" >&2
+    exit "$status"
+}
+trap startup_error ERR
+
+printf 'worker_entrypoint_started\n'
+printf 'worker_build=%s\n' "${WORKER_BUILD_SHA:-local}"
+STARTUP_PHASE="preflight"
+printf 'startup_phase=%s\n' "$STARTUP_PHASE"
+
+if [[ "${WORKER_STARTUP_SELF_TEST:-0}" == "1" ]]; then
+    [[ -x /bin/bash ]]
+    PYTHON_BIN="$(command -v python3)"
+    [[ -x "$PYTHON_BIN" ]]
+    [[ -f /handler.py ]]
+    [[ -f /model_artifacts.py ]]
+    COMFYUI_DIR=/workspace/runpod-slim/ComfyUI \
+    LORA_DIR=/workspace/runpod-slim/ComfyUI/models/loras \
+    "$PYTHON_BIN" -c "import sys; sys.path.insert(0, '/'); import boto3, handler, model_artifacts, requests, runpod, websocket"
+    printf 'startup_self_test_passed\n'
+    exit 0
+fi
+
+STARTUP_PHASE="volume"
+cd /
+[[ -d /runpod-volume ]]
+MOUNTPOINT_BIN="$(command -v mountpoint)"
+[[ -x "$MOUNTPOINT_BIN" ]]
+"$MOUNTPOINT_BIN" -q /runpod-volume
+
+# The network volume is the only supported workspace. Never recursively delete
+# an ambiguous /workspace path: an unexpected non-empty path is a hard error.
+if [[ -L /workspace ]]; then
+    [[ "$(readlink -f /workspace)" == "/runpod-volume" ]]
+elif [[ -e /workspace ]]; then
+    [[ -d /workspace ]]
+    [[ -z "$(find /workspace -mindepth 1 -maxdepth 1 -print -quit)" ]]
+    rmdir /workspace
+fi
+[[ ! -e /workspace && ! -L /workspace ]]
 ln -s /runpod-volume /workspace
 
-# ОПРЕДЕЛЯЕМ ПЕРЕМЕННЫЕ (вы их случайно пропустили!)
-COMFYUI_DIR="/workspace/runpod-slim/ComfyUI"
+# One explicit path shared with handler.py; no alternative-path probing.
+export COMFYUI_DIR="/workspace/runpod-slim/ComfyUI"
+export LORA_DIR="$COMFYUI_DIR/models/loras"
 VENV_DIR="$COMFYUI_DIR/.venv-cu128"
+[[ -f "$COMFYUI_DIR/main.py" ]]
+[[ -x "$VENV_DIR/bin/python" ]]
 
-CONFIG_PATH="/workspace/runpod-slim/ComfyUI/custom_nodes/comfyui_tinyterranodes/config.ini"
+CONFIG_PATH="$COMFYUI_DIR/custom_nodes/comfyui_tinyterranodes/config.ini"
 LOCAL_TMP_CONFIG="/tmp/ttn_config.ini"
 
-# 1. Сначала восстанавливаем для КАЖДОГО воркера локальный эталонный конфиг в /tmp, 
-# чтобы плагину сразу было с чем работать (полный дефолтный конфиг ttN)
+# Restore a per-worker local reference config before ComfyUI starts.
 cat <<EOF > "$LOCAL_TMP_CONFIG"
 [Versions]
 tinyterranodes = 2.0.9
@@ -37,65 +81,47 @@ enable_dynamic_widgets = True
 enable_dev_nodes = False
 EOF
 
-# 2. Атомарная (неуязвимая) подмена проблемного файла на симлинк через Python
-python3 -c '
+STARTUP_PHASE="config"
+CONFIG_PATH="$CONFIG_PATH" LOCAL_TMP_CONFIG="$LOCAL_TMP_CONFIG" python3 -c '
 import os
 import uuid
 
-config = "'"$CONFIG_PATH"'"
-tmp_config = "'"$LOCAL_TMP_CONFIG"'"
+config = os.environ["CONFIG_PATH"]
+tmp_config = os.environ["LOCAL_TMP_CONFIG"]
 
 try:
     if not os.path.islink(config):
-        print("🛠 Устранение конфликта ttN: Атомарная подмена конфига...")
-        # Создаем временный симлинк со случайным именем (никто с ним не пересечется)
+        print("Replacing ttN config with an atomic symlink")
         tmp_link = config + "." + str(uuid.uuid4())
         os.symlink(tmp_config, tmp_link)
-        # Атомарно перезаписываем битый файл нашим симлинком (за 1 такт процессора)
         os.replace(tmp_link, config)
-except Exception as e:
-    print("Warning during symlink swap:", e)
+except Exception as error:
+    print("Warning during symlink swap:", error)
 '
-# Активируем venv, если он есть
-if [ -d "$VENV_DIR" ]; then
-    source "$VENV_DIR/bin/activate"
-    echo "Activated venv: $VENV_DIR"
-else
-    echo "Warning: VENV_DIR not found, using system python"
-fi
+
+STARTUP_PHASE="python"
+source "$VENV_DIR/bin/activate"
+echo "Activated venv: $VENV_DIR"
 
 cd "$COMFYUI_DIR"
 
-# Жестко удаляем проблемную ноду, так как она крашит запуск, а ты её не используешь
+# This custom node is incompatible with the worker contract and is not used.
 echo "Removing problematic ComfyUI-SaveImageWithMetaData node..."
-rm -rf "custom_nodes/comfyui-saveimagewithmetadata" || true
-rm -rf "custom_nodes/ComfyUI-SaveImageWithMetaData" || true
-rm -rf "custom_nodes/Comfyui-SaveImageWithMetaData" || true
+rm -rf "custom_nodes/comfyui-saveimagewithmetadata"
+rm -rf "custom_nodes/ComfyUI-SaveImageWithMetaData"
+rm -rf "custom_nodes/Comfyui-SaveImageWithMetaData"
 
-# ==============================================================================
-# Принудительное скачивание LoRA перед запуском
-# ==============================================================================
-LORA_DIR="$COMFYUI_DIR/models/loras"
-LORA_NAME="pilemating_v1.safetensors"
-LORA_URL="https://civitai.red/api/download/models/1881743?fileId=1781560&token=6e6ecd3f0a435ff0e8146438871b33c3"
-
-mkdir -p "$LORA_DIR"
-if [ ! -f "$LORA_DIR/$LORA_NAME" ]; then
-    echo "Downloading LoRA: $LORA_NAME..."
-    curl -L -k "$LORA_URL" -o "$LORA_DIR/$LORA_NAME"
-    echo "LoRA downloaded successfully."
-else
-    echo "LoRA $LORA_NAME already exists, skipping download."
-fi
-
-# Запускаем ComfyUI в фоне и пишем логи в файл (в локальный /comfyui.log - это отлично!)
+STARTUP_PHASE="comfy"
 FIXED_ARGS="--listen 0.0.0.0 --port 8188"
 echo "Starting ComfyUI with args: $FIXED_ARGS"
 python -u main.py $FIXED_ARGS > /comfyui.log 2>&1 &
+COMFY_PID=$!
+sleep 2
+kill -0 "$COMFY_PID"
 
 echo "=== Starting RunPod Serverless Handler ==="
-# Выходим из venv, чтобы запустить хендлер системным питоном (где мы установили runpod sdk)
+STARTUP_PHASE="handler"
 deactivate 2>/dev/null || true
 
 cd /
-python3 /handler.py
+exec python3 /handler.py
