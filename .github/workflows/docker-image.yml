@@ -85,7 +85,12 @@ jobs:
           with open('/tmp/worker-image-inspect.json', encoding='utf-8') as stream:
               inspected = json.load(stream)
 
-          image = inspected.get('Image')
+          # `--format '{{json .}}'` serializes the Buildx context with
+          # lower-case top-level fields (`image`, `manifest`), while older
+          # Buildx versions exposed the Go field names. Accept both shapes so
+          # the remote contract check verifies the published image instead of
+          # rejecting a valid manifest because of serializer casing.
+          image = inspected.get('image') or inspected.get('Image')
           if isinstance(image, dict) and 'config' not in image:
               image = image.get('linux/amd64')
           if not isinstance(image, dict) or not isinstance(image.get('config'), dict):
