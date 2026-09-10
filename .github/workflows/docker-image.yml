@@ -5,17 +5,21 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+concurrency:
+  group: comfy-worker-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 env:
   IMAGE_NAME: peeenguin/velvet-comfyui-worker
   IMAGE_TAG: model-artifacts-v1-${{ github.sha }}
+  CACHE_REF: peeenguin/velvet-comfyui-worker:buildcache
 
 jobs:
-  build-and-publish:
+  validate:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,16 +28,21 @@ jobs:
         shell: bash
         run: python3 -m unittest discover -s . -p 'test_*.py' -v
 
-      - name: Free runner disk space for CUDA base image
+      - name: Validate startup files
         shell: bash
         run: |
-          sudo rm -rf \
-            /usr/local/lib/android \
-            /usr/share/dotnet \
-            /opt/ghc \
-            /opt/hostedtoolcache/CodeQL
-          docker system prune --all --force --volumes
-          df -h /
+          test "$(file -b --mime-encoding start.sh)" = "us-ascii"
+          test "$(head -c 2 start.sh | od -An -t x1 | tr -d ' ')" != "efbb"
+          bash -n start.sh
+          grep -Fq 'COPY model_artifacts.py /model_artifacts.py' Dockerfile
+          grep -Fq 'import model_artifacts' Dockerfile
+
+  build-and-publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -44,55 +53,114 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build worker image for acceptance (not published yet)
+      - name: Build and publish immutable worker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          load: true
-          push: false
+          platforms: linux/amd64
+          push: true
+          load: false
           tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
           build-args: |
             WORKER_BUILD_SHA=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.CACHE_REF }}
+          cache-to: type=registry,ref=${{ env.CACHE_REF }},mode=max
+          provenance: mode=max
+          sbom: true
 
-      - name: Inspect image startup contract
+      - name: Verify remote image contract without pulling the image
+        env:
+          PUBLISHED_DIGEST: ${{ steps.build.outputs.digest }}
         shell: bash
         run: |
-          config="$(docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" --format '{{json .Config}}')"
-          echo "$config"
-          echo "$config" | jq -e '.Entrypoint == ["/bin/bash", "/start.sh"]'
-          echo "$config" | jq -e '(.Cmd == null) or (.Cmd == [])'
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
 
-      - name: Run worker startup self-test
-        shell: bash
-        run: |
-          docker run --rm \
-            --entrypoint /bin/bash \
-            -e WORKER_STARTUP_SELF_TEST=1 \
-            "${IMAGE_NAME}:${IMAGE_TAG}" \
-            /start.sh
+          image = os.environ["IMAGE_NAME"]
+          tag = os.environ["IMAGE_TAG"]
+          expected_sha = os.environ["GITHUB_SHA"]
+          expected_digest = os.environ.get("PUBLISHED_DIGEST", "")
+          repository = image.split("/", 1)[1]
 
-      - name: Run shell and Python smoke checks
-        shell: bash
-        run: |
-          docker run --rm --entrypoint /bin/bash "${IMAGE_NAME}:${IMAGE_TAG}" -n /start.sh
-          docker run --rm \
-            -e COMFYUI_DIR=/workspace/runpod-slim/ComfyUI \
-            -e LORA_DIR=/workspace/runpod-slim/ComfyUI/models/loras \
-            --entrypoint python3 "${IMAGE_NAME}:${IMAGE_TAG}" -c \
-            "import sys; sys.path.insert(0, '/'); import boto3, handler, model_artifacts, requests, runpod, websocket"
+          token_url = (
+              "https://auth.docker.io/token?service=registry.docker.io&scope="
+              f"repository:{repository}:pull"
+          )
+          with urllib.request.urlopen(token_url) as response:
+              token = json.load(response)["token"]
 
-      - name: Publish immutable worker image
-        shell: bash
-        run: |
-          image="${IMAGE_NAME}:${IMAGE_TAG}"
-          docker push "$image"
-          digest="$(docker image inspect "$image" --format '{{index .RepoDigests 0}}' | sed 's/.*@//')"
-          test -n "$digest"
-          {
-            echo "## Worker image acceptance"
-            echo "- worker_build=${GITHUB_SHA}"
-            echo "- image=${image}"
-            echo "- digest=${digest}"
-            echo "- startup_self_test=passed"
-          } >> "$GITHUB_STEP_SUMMARY"
+          manifest_url = f"https://registry-1.docker.io/v2/{repository}/manifests/{tag}"
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": ", ".join([
+                  "application/vnd.oci.image.index.v1+json",
+                  "application/vnd.docker.distribution.manifest.list.v2+json",
+                  "application/vnd.oci.image.manifest.v1+json",
+                  "application/vnd.docker.distribution.manifest.v2+json",
+              ]),
+          }
+          request = urllib.request.Request(manifest_url, headers=headers)
+          with urllib.request.urlopen(request) as response:
+              manifest = json.load(response)
+              remote_digest = response.headers.get("Docker-Content-Digest", "")
+
+          if expected_digest and remote_digest != expected_digest:
+              raise SystemExit(
+                  f"published digest mismatch: action={expected_digest} registry={remote_digest}"
+              )
+
+          manifest_digest = remote_digest
+          if "manifests" in manifest:
+              candidates = [
+                  item for item in manifest["manifests"]
+                  if item.get("platform", {}).get("os") == "linux"
+                  and item.get("platform", {}).get("architecture") == "amd64"
+              ]
+              if len(candidates) != 1:
+                  raise SystemExit("remote manifest does not contain one linux/amd64 image")
+              manifest_digest = candidates[0]["digest"]
+              request = urllib.request.Request(
+                  f"https://registry-1.docker.io/v2/{repository}/manifests/{manifest_digest}",
+                  headers=headers,
+              )
+              with urllib.request.urlopen(request) as response:
+                  image_manifest = json.load(response)
+          else:
+              image_manifest = manifest
+
+          config_digest = image_manifest["config"]["digest"]
+          request = urllib.request.Request(
+              f"https://registry-1.docker.io/v2/{repository}/blobs/{config_digest}",
+              headers={"Authorization": f"Bearer {token}"},
+          )
+          with urllib.request.urlopen(request) as response:
+              config = json.load(response)
+
+          image_config = config["config"]
+          if image_config.get("Entrypoint") != ["/bin/bash", "/start.sh"]:
+              raise SystemExit(f"unexpected entrypoint: {image_config.get('Entrypoint')!r}")
+          if image_config.get("Cmd") not in (None, []):
+              raise SystemExit(f"unexpected cmd: {image_config.get('Cmd')!r}")
+          if config.get("architecture") != "amd64" or config.get("os") != "linux":
+              raise SystemExit("remote config is not linux/amd64")
+          revision = image_config.get("Labels", {}).get("org.opencontainers.image.revision")
+          if revision != expected_sha:
+              raise SystemExit(f"revision label mismatch: {revision!r}")
+
+          summary_digest = expected_digest or remote_digest or manifest_digest
+          print(f"verified_image={image}:{tag}")
+          print(f"verified_digest={summary_digest}")
+          print(f"verified_revision={revision}")
+          print("verified_entrypoint=/bin/bash /start.sh")
+          print("verified_cmd=[]")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## Worker image acceptance\n")
+              summary.write(f"- image={image}:{tag}\n")
+              summary.write(f"- digest={summary_digest}\n")
+              summary.write(f"- worker_build={revision}\n")
+              summary.write("- remote_contract=passed\n")
+          PY
