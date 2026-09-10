@@ -73,9 +73,12 @@ jobs:
       - name: Verify remote image contract without pulling the image
         env:
           PUBLISHED_DIGEST: ${{ steps.build.outputs.digest }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         shell: bash
         run: |
           python3 - <<'PY'
+          import base64
           import json
           import os
           import urllib.request
@@ -90,7 +93,14 @@ jobs:
               "https://auth.docker.io/token?service=registry.docker.io&scope="
               f"repository:{repository}:pull"
           )
-          with urllib.request.urlopen(token_url) as response:
+          credentials = base64.b64encode(
+              f"{os.environ['DOCKERHUB_USERNAME']}:{os.environ['DOCKERHUB_TOKEN']}".encode()
+          ).decode()
+          token_request = urllib.request.Request(
+              token_url,
+              headers={"Authorization": f"Basic {credentials}"},
+          )
+          with urllib.request.urlopen(token_request) as response:
               token = json.load(response)["token"]
 
           manifest_url = f"https://registry-1.docker.io/v2/{repository}/manifests/{tag}"
