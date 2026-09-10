@@ -43,8 +43,14 @@ if [[ -L /workspace ]]; then
     [[ "$(readlink -f /workspace)" == "/runpod-volume" ]]
 elif [[ -e /workspace ]]; then
     [[ -d /workspace ]]
-    [[ -z "$(find /workspace -mindepth 1 -maxdepth 1 -print -quit)" ]]
-    rmdir /workspace
+    if [[ -n "$(find /workspace -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+        WORKSPACE_IMAGE_BACKUP="/tmp/worker-image-workspace"
+        [[ ! -e "$WORKSPACE_IMAGE_BACKUP" && ! -L "$WORKSPACE_IMAGE_BACKUP" ]]
+        mv /workspace "$WORKSPACE_IMAGE_BACKUP"
+        printf 'workspace_image_relocated=%s\n' "$WORKSPACE_IMAGE_BACKUP"
+    else
+        rmdir /workspace
+    fi
 fi
 [[ ! -e /workspace && ! -L /workspace ]]
 ln -s /runpod-volume /workspace
