@@ -114,7 +114,7 @@ rm -rf "custom_nodes/Comfyui-SaveImageWithMetaData"
 STARTUP_PHASE="comfy"
 FIXED_ARGS="--listen 0.0.0.0 --port 8188"
 echo "Starting ComfyUI with args: $FIXED_ARGS"
-python -u main.py $FIXED_ARGS > /comfyui.log 2>&1 &
+"$VENV_DIR/bin/python" -u main.py $FIXED_ARGS > /comfyui.log 2>&1 &
 COMFY_PID=$!
 sleep 2
 kill -0 "$COMFY_PID"
